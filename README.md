@@ -6,12 +6,19 @@ End-to-end demo project that predicts likely diseases from symptoms and provides
 
 ## Features
 - CLI interface to enter symptoms and patient preferences
-- Simple ML-free baseline predictor (Jaccard similarity on symptom sets)
+- ML-based predictor (Random Forest trained from the symptom knowledge base)
+
 - Treatment recommender with disease-specific templates
 - Extensible strategy/personalities system
 
 ## Run
+### 0) Install dependencies
+```bash
+pip install -r requirements.txt
+```
+
 ### 1) (Optional) Create a virtual environment
+
 ```bash
 python -m venv .venv
 .venv\Scripts\activate

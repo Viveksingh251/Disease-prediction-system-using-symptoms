@@ -1,2 +1,6 @@
-# No external dependencies for this demo project
+# External dependencies for ML + web UI
+flask>=3.0.0
+scikit-learn>=1.4.0
+joblib>=1.4.0
+
 

@@ -1,0 +1,14 @@
+{
+  "prediction_logs": [
+    {
+      "username": "ankurtiwari5434",
+      "symptoms": [
+        "fever",
+        "cough",
+        "body aches"
+      ],
+      "predicted_disease": "Influenza (Flu)",
+      "predicted_score": 0.9916666666666667
+    }
+  ]
+}

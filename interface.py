@@ -16,13 +16,24 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any, Dict, List
 
-from flask import Flask, redirect, render_template_string, request
+from flask import Flask, render_template_string, request, session, redirect
 
 from diseases import DISEASE_DB, normalize_symptom
+from auth_store import AuthStore
+from user_data_store import PredictionLog, UserDataStore
+from auth_routes import try_login, try_signup
+from ml_eval import evaluate_classifier
+from graphs import eval_outputs_to_template_context
 from predictor import predict_disease
 from recommenders import build_personalities, recommend_treatment
 
 app = Flask(__name__)
+
+# Session secret (demo only; for real deployments set via env var)
+app.secret_key = "dev-secret-key-change-me"
+
+auth_store = AuthStore(path="auth_users.json")
+user_data_store = UserDataStore(path="user_data.json")
 
 TEMPLATE = """
 <!doctype html>
@@ -55,7 +66,18 @@ TEMPLATE = """
   </style>
 </head>
 <body>
-  <h2>Disease Prediction System</h2>
+  <div class="topbar">
+    <h2>Disease Prediction System</h2>
+    <div>
+      {% if session.get('username') %}
+        <span class="pill">Logged in as {{ session.get('username') }}</span>
+        <form method="post" action="/logout" style="display:inline;margin-left:10px">
+          <button class="ghost" type="submit" style="padding:8px 12px;border-radius:12px">Logout</button>
+        </form>
+      {% endif %}
+    </div>
+  </div>
+
   <p class="hint">Enter symptoms and a basic patient profile. The app predicts a likely disease and shows personalized treatment using a selected personality strategy.</p>
 
   <form method="post">
@@ -117,7 +139,6 @@ TEMPLATE = """
     </script>
   </form>
 
-
   {% if result %}
     <div class="card">
       <h3>Prediction</h3>
@@ -128,6 +149,29 @@ TEMPLATE = """
       <h3>Personalized Treatment</h3>
       <pre>{{ result.treatment }}</pre>
     </div>
+
+    {% if result.graphs %}
+      <div class="card">
+        <h3>Accuracy & Evaluation Graphs</h3>
+        <p class="hint">Generated from the project’s internal synthetic evaluation data.</p>
+
+        <div class="grid" style="margin-top:12px">
+          <div>
+            <label>Confusion matrix</label>
+            <img style="width:100%;border-radius:12px;border:1px solid rgba(148,163,184,.25)" src="{{ result.graphs.confusion_matrix_png }}" alt="confusion matrix"/>
+          </div>
+          <div>
+            <label>Accuracy chart</label>
+            <img style="width:100%;border-radius:12px;border:1px solid rgba(148,163,184,.25)" src="{{ result.graphs.accuracy_curve_png }}" alt="accuracy chart"/>
+          </div>
+        </div>
+
+        <div style="margin-top:12px">
+          <label>Prediction score graph</label>
+          <img style="width:100%;border-radius:12px;border:1px solid rgba(148,163,184,.25)" src="{{ result.graphs.score_curve_png }}" alt="prediction score graph"/>
+        </div>
+      </div>
+    {% endif %}
 
     <div class="card">
       <h3>Optional: Other personalities</h3>
@@ -169,8 +213,357 @@ def parse_list_csv(s: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
+def _require_login():
+    if not session.get("username"):
+        return redirect("/login")
+    return None
+
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if request.method == "GET":
+        return render_template_string(
+            """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Sign Up - Disease Prediction</title>
+  <style>
+    :root{
+      --bg:#070b18;--panel:rgba(15,23,42,.78);--text:#e5e7eb;
+      --muted:#94a3b8;--primary:#7c3aed;--primary2:#3b82f6;
+      --border:rgba(148,163,184,.25);--bad:#ef4444;--good:#22c55e;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; min-height:100vh; color:var(--text);
+      font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      background:
+        radial-gradient(1200px 650px at 20% 15%, rgba(124,58,237,.35), transparent 60%),
+        radial-gradient(900px 520px at 90% 25%, rgba(59,130,246,.35), transparent 55%),
+        linear-gradient(135deg,#070b18,#0b1220,#111827);
+      display:flex; align-items:center; justify-content:center;
+      padding:24px; overflow:hidden;
+    }
+
+    /* Background “images” related to the project: pattern grid + blobs */
+    .bg-grid{
+      position:fixed; inset:0;
+      background-image:
+        linear-gradient(rgba(148,163,184,.08) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(148,163,184,.08) 1px, transparent 1px);
+      background-size:60px 60px;
+      opacity:.35;
+      pointer-events:none;
+      mask-image: radial-gradient(800px 500px at 50% 20%, black 45%, transparent 75%);
+    }
+    .blob{position:fixed; border-radius:999px; filter:blur(34px); opacity:.55; pointer-events:none; animation: floaty 8s ease-in-out infinite;}
+    .b1{width:420px;height:420px;left:-140px;top:-120px;background:rgba(124,58,237,.55)}
+    .b2{width:520px;height:520px;right:-220px;top:60px;background:rgba(59,130,246,.45);animation-delay:-2s}
+    .b3{width:380px;height:380px;left:10%;bottom:-190px;background:rgba(34,197,94,.22);animation-delay:-4s}
+    @keyframes floaty{0%,100%{transform:translateY(0)}50%{transform:translateY(18px)}}
+
+    .wrap{width:100%; max-width:620px; position:relative; z-index:2}
+    .card{
+      background:var(--panel);
+      border:1px solid var(--border);
+      border-radius:18px;
+      box-shadow:0 30px 80px rgba(0,0,0,.45);
+      padding:22px;
+    }
+    .badge{display:inline-block;padding:6px 10px;border-radius:999px;background:rgba(124,58,237,.18);border:1px solid rgba(124,58,237,.35);color:#ddd6fe;font-weight:800;font-size:12px;margin-bottom:10px}
+    h1{margin:0; font-size:26px; letter-spacing:.2px}
+    .subtitle{margin:10px 0 0; color:var(--muted); line-height:1.55}
+
+    .feature{
+      margin:16px 0 18px;
+      padding:14px;
+      border-radius:16px;
+      background:rgba(2,6,23,.25);
+      border:1px solid rgba(148,163,184,.18);
+    }
+    .feature strong{color:#bfdbfe}
+    .feature ul{margin:10px 0 0; padding-left:18px; color:var(--muted)}
+    .feature li{margin:6px 0}
+
+    label{display:block; font-weight:800; color:#dbeafe; margin:12px 0 6px}
+    input{width:100%; padding:12px; border-radius:12px; border:1px solid rgba(148,163,184,.35); background:rgba(2,6,23,.35); color:var(--text); outline:none}
+    input:focus{border-color:rgba(59,130,246,.9); box-shadow:0 0 0 3px rgba(59,130,246,.18)}
+
+    .btn{width:100%; margin-top:18px; padding:12px 14px; border:none; border-radius:12px; background:linear-gradient(135deg,var(--primary),var(--primary2)); color:#fff; font-weight:900; cursor:pointer}
+    .btn:active{transform:translateY(1px)}
+
+    .err{color:var(--bad); margin-top:10px; font-weight:800}
+    .small{color:var(--muted); font-size:12px; margin-top:14px; line-height:1.5}
+    a.link{color:#93c5fd; text-decoration:none; font-weight:900}
+    a.link:hover{text-decoration:underline}
+  </style>
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div class="blob b1"></div>
+  <div class="blob b2"></div>
+  <div class="blob b3"></div>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="badge">Create account</div>
+      <h1>Disease Prediction System</h1>
+      <p class="subtitle">Sign up to use disease predictions, evaluation graphs, and personalized treatment recommendations.</p>
+
+      <div class="feature">
+        <strong>What this project supports</strong>
+        <ul>
+          <li>Login/Signup authentication (stored locally)</li>
+          <li>Disease prediction from symptoms</li>
+          <li>Personalized treatment by different personalities</li>
+          <li>Accuracy & evaluation charts</li>
+        </ul>
+      </div>
+
+      <form method='post'>
+        <label>Username</label>
+        <input name='username' placeholder='Choose a username' autofocus/>
+
+        <label>Password</label>
+        <input name='password' type='password' placeholder='Create a password'/>
+
+        <button class='btn' type='submit'>Create account</button>
+      </form>
+
+      <div class="err">{{ error or '' }}</div>
+      <div class="small">Already have an account? <a class="link" href='/login'>Login</a></div>
+    </div>
+  </div>
+</body>
+</html>
+            """,
+            error=None,
+        )
+
+
+    ok, msg = try_signup(request, auth_store)
+    if not ok:
+        return render_template_string(
+            """
+            <h2>Sign up</h2>
+            <form method='post'>
+              <label>Username</label><input name='username' value='{{request.form.get('username','')}}'/><br/>
+              <label>Password</label><input name='password' type='password'/><br/>
+              <button type='submit'>Create account</button>
+            </form>
+            <p style='color:#ef4444;'>{{ msg }}</p>
+            <p><a href='/login'>Back to login</a></p>
+            """,
+            msg=msg,
+        )
+
+    return redirect("/login")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        return render_template_string(
+            """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Login - Disease Prediction</title>
+  <style>
+    :root{
+      --bg:#070b18;--panel:rgba(15,23,42,.78);--text:#e5e7eb;
+      --muted:#94a3b8;--primary:#7c3aed;--primary2:#3b82f6;--border:rgba(148,163,184,.25);
+      --good:#22c55e;--bad:#ef4444;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; min-height:100vh; color:var(--text);
+      font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      background:
+        radial-gradient(1200px 600px at 10% 10%, rgba(124,58,237,.35), transparent 60%),
+        radial-gradient(900px 500px at 90% 20%, rgba(59,130,246,.35), transparent 55%),
+        linear-gradient(135deg,#070b18,#0b1220,#111827);
+      display:flex; align-items:center; justify-content:center;
+      padding:24px;
+      overflow:hidden;
+    }
+    /* “images” in the background (pure CSS blobs + subtle grid) */
+    .bg-grid{
+      position:fixed; inset:0;
+      background-image: linear-gradient(rgba(148,163,184,.08) 1px, transparent 1px),
+                        linear-gradient(90deg, rgba(148,163,184,.08) 1px, transparent 1px);
+      background-size: 60px 60px;
+      opacity:.35;
+      pointer-events:none;
+      mask-image: radial-gradient(800px 450px at 50% 20%, black 45%, transparent 75%);
+    }
+    .blob{
+      position:fixed; border-radius:999px; filter:blur(34px);
+      opacity:.55; pointer-events:none;
+      animation: floaty 8s ease-in-out infinite;
+    }
+    .b1{width:420px;height:420px;left:-140px;top:-120px;background:rgba(124,58,237,.55)}
+    .b2{width:520px;height:520px;right:-220px;top:60px;background:rgba(59,130,246,.45);animation-delay:-2s}
+    .b3{width:380px;height:380px;left:10%;bottom:-190px;background:rgba(34,197,94,.22);animation-delay:-4s}
+    @keyframes floaty{0%,100%{transform:translateY(0)}50%{transform:translateY(18px)}}
+
+    .wrap{width:100%; max-width:560px; position:relative; z-index:2}
+    .card{
+      background:var(--panel); border:1px solid var(--border);
+      border-radius:18px; box-shadow:0 30px 80px rgba(0,0,0,.45);
+      padding:22px;
+    }
+    h1{margin:0; font-size:26px; letter-spacing:.2px}
+    .subtitle{margin:10px 0 0; color:var(--muted); line-height:1.55}
+
+    .feature-list{margin:14px 0 18px; padding-left:18px; color:var(--text)}
+    .feature-list li{margin:6px 0; color:var(--muted)}
+    .badge{
+      display:inline-block; padding:6px 10px; border-radius:999px;
+      background:rgba(124,58,237,.18); border:1px solid rgba(124,58,237,.35);
+      color:#ddd6fe; font-weight:700; font-size:12px;
+      margin-bottom:10px;
+    }
+
+    label{display:block; font-weight:700; color:#dbeafe; margin:12px 0 6px}
+    input{
+      width:100%; padding:12px 12px; border-radius:12px;
+      border:1px solid rgba(148,163,184,.35);
+      background:rgba(2,6,23,.35); color:var(--text);
+      outline:none;
+    }
+    input:focus{border-color:rgba(59,130,246,.9); box-shadow:0 0 0 3px rgba(59,130,246,.18)}
+
+    .btn{
+      width:100%; margin-top:16px;
+      padding:12px 14px; border:none; border-radius:12px;
+      background:linear-gradient(135deg,var(--primary),var(--primary2));
+      color:#fff; font-weight:800; cursor:pointer;
+    }
+    .btn:active{transform:translateY(1px)}
+    .row{display:flex; gap:12px; align-items:center; margin-top:14px}
+    .ghost{
+      width:100%; text-align:center; padding:10px 14px;
+      border-radius:12px; border:1px solid var(--border);
+      background:transparent; color:var(--text); font-weight:800;
+      text-decoration:none; display:inline-block;
+    }
+
+    .err{color:var(--bad); margin-top:10px; font-weight:700}
+    .ok{color:var(--good); margin-top:10px; font-weight:700}
+
+    .small{color:var(--muted); font-size:12px; margin-top:14px; line-height:1.5}
+    a.link{color:#93c5fd; text-decoration:none; font-weight:800}
+    a.link:hover{text-decoration:underline}
+  </style>
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div class="blob b1"></div>
+  <div class="blob b2"></div>
+  <div class="blob b3"></div>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="badge">Login to continue</div>
+      <h1>Disease Prediction System</h1>
+      <p class="subtitle">Upload/enter symptoms and get a disease prediction + personalized treatment.</p>
+      <ul class="feature-list">
+        <li>Login/Signup authentication (stored locally in <b>auth_users.json</b>)</li>
+        <li>Disease prediction from symptoms (ML-backed baseline model)</li>
+        <li>Personalized treatment using different “personalities” strategies</li>
+        <li>Evaluation charts: confusion matrix, accuracy chart, prediction score graph</li>
+      </ul>
+
+      <form method='post'>
+        <label>Username</label>
+        <input name='username' placeholder='Enter username' autofocus/>
+        <label>Password</label>
+        <input name='password' type='password' placeholder='Enter password'/>
+        <button class='btn' type='submit'>Login</button>
+      </form>
+
+      <div class="err">{{ error or '' }}</div>
+      <div class="small">
+        New here? <a class="link" href='/signup'>Create an account</a>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+            """,
+            error=None,
+        )
+
+    ok, msg = try_login(request, auth_store)
+    if not ok:
+        return render_template_string(
+            """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Login - Disease Prediction</title>
+  <style>
+    :root{--bg:#070b18;--panel:rgba(15,23,42,.78);--text:#e5e7eb;--muted:#94a3b8;--primary:#7c3aed;--primary2:#3b82f6;--border:rgba(148,163,184,.25);--bad:#ef4444}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;color:var(--text);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:linear-gradient(135deg,#070b18,#0b1220,#111827);display:flex;align-items:center;justify-content:center;padding:24px}
+    .card{width:100%;max-width:520px;background:var(--panel);border:1px solid var(--border);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,.45);padding:22px}
+    .badge{display:inline-block;padding:6px 10px;border-radius:999px;background:rgba(124,58,237,.18);border:1px solid rgba(124,58,237,.35);color:#ddd6fe;font-weight:700;font-size:12px;margin-bottom:10px}
+    h1{margin:0;font-size:26px;letter-spacing:.2px}
+    .subtitle{margin:10px 0 0;color:var(--muted);line-height:1.55}
+    label{display:block;font-weight:700;color:#dbeafe;margin:12px 0 6px}
+    input{width:100%;padding:12px;border-radius:12px;border:1px solid rgba(148,163,184,.35);background:rgba(2,6,23,.35);color:var(--text);outline:none}
+    input:focus{border-color:rgba(59,130,246,.9);box-shadow:0 0 0 3px rgba(59,130,246,.18)}
+    .btn{width:100%;margin-top:16px;padding:12px 14px;border:none;border-radius:12px;background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;font-weight:800;cursor:pointer}
+    .err{color:var(--bad);margin-top:10px;font-weight:800}
+    .small{color:var(--muted);font-size:12px;margin-top:14px;line-height:1.5}
+    a{color:#93c5fd;text-decoration:none;font-weight:800}
+    a:hover{text-decoration:underline}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">Login to continue</div>
+    <h1>Disease Prediction System</h1>
+    <p class="subtitle">Authentication failed. Please try again.</p>
+
+    <form method='post'>
+      <label>Username</label>
+      <input name='username' value='{{request.form.get("username","")}}' placeholder='Enter username' autofocus/>
+      <label>Password</label>
+      <input name='password' type='password' placeholder='Enter password'/>
+      <button class='btn' type='submit'>Login</button>
+    </form>
+
+    <div class="err">{{ msg }}</div>
+    <div class="small">New here? <a href='/signup'>Create an account</a></div>
+  </div>
+</body>
+</html>
+            """,
+            msg=msg,
+        )
+
+    session["username"] = (request.form.get("username") or "").strip()
+    return redirect("/")
+
+
+@app.route("/logout", methods=["POST", "GET"])
+def logout():
+    session.pop("username", None)
+    return redirect("/login")
+
+
 @app.route("/", methods=["GET", "POST"])
 def home():
+    _redirect = _require_login()
+    if _redirect is not None:
+        return _redirect
+
     if request.method == "GET":
         return render_template_string(TEMPLATE, result=None)
 
@@ -185,7 +578,6 @@ def home():
     user_symptoms = [normalize_symptom(x) for x in user_symptoms_raw if normalize_symptom(x)]
 
     if not user_symptoms:
-        # Keep UI simple: show empty result
         return render_template_string(
             TEMPLATE,
             result={
@@ -206,7 +598,9 @@ def home():
     pred = predict_disease(user_symptoms, DISEASE_DB)
 
     personalities = build_personalities()
-    personality_key = "conservative" if profile.risk_tolerance == "low" else "balanced" if profile.risk_tolerance == "medium" else "aggressive"
+    personality_key = (
+        "conservative" if profile.risk_tolerance == "low" else "balanced" if profile.risk_tolerance == "medium" else "aggressive"
+    )
     personality = personalities[personality_key]
 
     treatment = recommend_treatment(pred.disease, profile, personality)
@@ -217,16 +611,62 @@ def home():
             continue
         other_treatments[key] = recommend_treatment(pred.disease, profile, p)
 
+    # Accuracy graphs / evaluation
+    graphs_ctx = None
+    try:
+        from ml_model import build_synthetic_dataset
+
+        X_list, y_keys, vocabulary = build_synthetic_dataset(DISEASE_DB)
+        if X_list and y_keys:
+            y_true: List[str] = []
+            y_pred: List[str] = []
+            predicted_scores: List[float] = []
+
+            vocab = list(vocabulary)
+            for x_vec, true_key in zip(X_list, y_keys):
+                true_symptoms = [vocab[i] for i, v in enumerate(x_vec) if int(v) == 1]
+                p = predict_disease(true_symptoms, DISEASE_DB)
+                y_true.append(true_key)
+                y_pred.append(p.disease)
+                predicted_scores.append(float(p.score))
+
+            label_map = sorted(set(y_true) | set(y_pred))
+
+            outputs = evaluate_classifier(
+                y_true=y_true,
+                y_pred=y_pred,
+                predicted_scores=predicted_scores,
+                label_map=label_map,
+            )
+            graphs_ctx = eval_outputs_to_template_context(outputs)
+    except Exception:
+        graphs_ctx = None
+
     result = {
         "prediction": f"Disease: {pred.disease}\nScore: {pred.score:.3f}\nMatching symptoms: {', '.join(pred.matched_symptoms) or 'None'}",
         "treatment": treatment,
         "other_treatments": other_treatments,
+        "graphs": graphs_ctx,
     }
+
+    # Persist prediction for the logged-in user
+    try:
+        username = session.get("username")
+        if username:
+            user_data_store.add_prediction_log(
+                PredictionLog(
+                    username=str(username),
+                    symptoms=user_symptoms,
+                    predicted_disease=pred.disease,
+                    predicted_score=float(pred.score),
+                )
+            )
+    except Exception:
+        pass
 
     return render_template_string(TEMPLATE, result=result)
 
 
 if __name__ == "__main__":
-    # Recommended for local dev only
     app.run(host="127.0.0.1", port=5000, debug=True)
 
