@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 
 @dataclass
 class ModelArtifacts:
     model: Any
-    vocabulary: list[str]
-    label_map: list[str]
+    # Feature columns order used during training (binary/multi-hot)
+    feature_columns: List[str]
+    # Label order used during training
+    label_map: List[str]
+
 
 
 _MODEL_ARTIFACTS: Optional[ModelArtifacts] = None

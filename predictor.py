@@ -5,7 +5,8 @@ from typing import Dict, List
 
 from diseases import Disease, normalize_symptom
 from model_store import ModelArtifacts, get_artifacts, set_artifacts
-from ml_model import build_synthetic_dataset, build_vocabulary, vectorize_symptoms
+from ml_model import load_training_csv, train_model_from_training_data, vectorize_user_symptoms
+
 
 
 @dataclass(frozen=True)
@@ -20,48 +21,27 @@ ML_MODEL_TYPE = "random_forest"  # or "decision_tree"
 
 
 def _train_and_cache_model(disease_db: Dict[str, Disease]):
-    """Train a small classifier from DISEASE_DB.
-
-    Note: This project has no real labeled patient dataset; we create a tiny
-    synthetic training set from each disease's symptom list.
-    """
+    """Train from Training.csv and cache the fitted model artifacts."""
 
     artifacts = get_artifacts()
     if artifacts is not None:
         return artifacts
 
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.tree import DecisionTreeClassifier
+    # Training.csv is stored in ../Desktop/ relative to this project folder.
+    training = load_training_csv(csv_path="../Desktop/Training.csv")
+    clf, label_map = train_model_from_training_data(training, model_type=ML_MODEL_TYPE)
 
-    X_list, y_keys, vocabulary = build_synthetic_dataset(disease_db)
-    if not X_list:
-        # fallback empty
-        return None
-
-    import numpy as np
-
-    X = np.array(X_list, dtype=np.int64)
-    label_map = sorted(set(y_keys))
-    y = np.array([label_map.index(k) for k in y_keys], dtype=np.int64)
-
-    if ML_MODEL_TYPE == "decision_tree":
-        clf = DecisionTreeClassifier(random_state=42, max_depth=6, min_samples_leaf=1)
-    else:
-        clf = RandomForestClassifier(
-            n_estimators=200,
-            random_state=42,
-            max_depth=None,
-            min_samples_leaf=1,
-        )
-
-    clf.fit(X, y)
-
-    artifacts = ModelArtifacts(model=clf, vocabulary=vocabulary, label_map=label_map)
+    artifacts = ModelArtifacts(
+        model=clf,
+        feature_columns=training.feature_columns,
+        label_map=label_map,
+    )
     set_artifacts(artifacts)
     return artifacts
 
 
 def predict_disease(
+
     user_symptoms: List[str],
     disease_db: Dict[str, Disease],
     top_k: int = 1,
@@ -75,7 +55,8 @@ def predict_disease(
         matched = sorted(set(user_symptoms) & set(first.symptoms))
         return Prediction(disease=first.name, score=0.0, matched_symptoms=matched)
 
-    x_vec = vectorize_symptoms(user_symptoms, artifacts.vocabulary)
+    x_vec = vectorize_user_symptoms(user_symptoms, artifacts.feature_columns)
+
 
     import numpy as np
 
@@ -95,10 +76,21 @@ def predict_disease(
         best_idx = int(clf.predict(Xq)[0])
         score = 0.0
 
-    disease_key = artifacts.label_map[best_idx]
-    disease = disease_db[disease_key]
+    predicted_label = artifacts.label_map[best_idx]
+
+    # Map predicted CSV label into our treatment knowledge base if possible.
+    # If not found, still return the predicted label.
+    disease = None
+    for d in disease_db.values():
+        if d.name == predicted_label or d.name.lower() == predicted_label.lower():
+            disease = d
+            break
+
+    if disease is None:
+        return Prediction(disease=predicted_label, score=score, matched_symptoms=sorted(set(user_symptoms)))
 
     matched = sorted(set(user_symptoms) & set(disease.symptoms))
     return Prediction(disease=disease.name, score=score, matched_symptoms=matched)
+
 
 

@@ -1,84 +1,92 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
 
-from diseases import Disease
+from dataclasses import dataclass
+from typing import List, Tuple
+
+import pandas as pd
 
 
 @dataclass(frozen=True)
-class VectorizerSpec:
-    vocabulary: List[str]
+class TrainingData:
+    X: "pd.DataFrame"
+    y: "pd.Series"
+    feature_columns: List[str]
+    label_map: List[str]
 
 
-def build_vocabulary(disease_db: Dict[str, Disease]) -> List[str]:
-    vocab = set()
-    for d in disease_db.values():
-        for s in d.symptoms:
-            vocab.add(s)
-    # deterministic ordering
-    return sorted(vocab)
+def _clean_training_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Drop unused junk columns frequently seen in the dataset export.
+    drop_cols = [c for c in df.columns if str(c).startswith("Unnamed:")]
+    drop_cols += ["fluid_overload.1"] if "fluid_overload.1" in df.columns else []
+    df = df.drop(columns=drop_cols, errors="ignore")
+    return df
 
 
-def vectorize_symptoms(user_symptoms: List[str], vocabulary: List[str]) -> List[int]:
-    vocab_index = {s: i for i, s in enumerate(vocabulary)}
-    x = [0] * len(vocabulary)
+def load_training_csv(csv_path: str) -> TrainingData:
+    """Load Training.csv and return prepared X/y.
+
+    Expects:
+      - feature columns are all binary symptom columns
+      - label column is `prognosis`
+
+    Cleans known extra columns (e.g., `Unnamed: 133`, `fluid_overload.1`).
+    """
+
+    df = pd.read_csv(csv_path)
+    df = _clean_training_columns(df)
+
+    if "prognosis" not in df.columns:
+        raise ValueError("Training.csv must contain a 'prognosis' column")
+
+    # Feature columns = all except prognosis
+    feature_columns = [c for c in df.columns if c != "prognosis"]
+
+    # Ensure deterministic column order
+    feature_columns = list(feature_columns)
+
+    # Cast features to numeric (0/1)
+    X = df[feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
+    y = df["prognosis"].astype(str)
+
+    label_map = sorted(y.unique().tolist())
+
+    return TrainingData(X=X, y=y, feature_columns=feature_columns, label_map=label_map)
+
+
+def vectorize_user_symptoms(user_symptoms: List[str], feature_columns: List[str]) -> List[int]:
+    col_index = {c: i for i, c in enumerate(feature_columns)}
+    x = [0] * len(feature_columns)
     for s in user_symptoms:
-        i = vocab_index.get(s)
+        # Training.csv symptom strings are already normalized; keep exact match.
+        i = col_index.get(s)
         if i is not None:
             x[i] = 1
     return x
 
 
-def build_synthetic_dataset(
-    disease_db: Dict[str, Disease],
-    *,
-    max_subsets_per_disease: int = 30,
-    min_subset_size: int = 1,
-) -> Tuple[List[List[int]], List[str], List[str]]:
-    """Create a tiny training set from the existing DISEASE_DB.
+def train_model_from_training_data(training: TrainingData, *, model_type: str = "random_forest") -> Tuple[object, List[str]]:
+    import numpy as np
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.tree import DecisionTreeClassifier
 
-    Because this project currently has no real labeled patient dataset,
-    we generate synthetic samples by taking random subsets of each
-    disease's symptom list and labeling them with that disease.
+    label_to_idx = {k: i for i, k in enumerate(training.label_map)}
+    y_idx = np.array([label_to_idx[k] for k in training.y.tolist()], dtype=np.int64)
 
-    Returns:
-      X (list of multi-hot vectors), y (list of disease keys), vocabulary
-    """
+    X_np = training.X.to_numpy(dtype=np.int64)
 
-    import random
+    if model_type == "decision_tree":
+        clf = DecisionTreeClassifier(random_state=42, max_depth=12, min_samples_leaf=1)
+    else:
+        clf = RandomForestClassifier(
+            n_estimators=400,
+            random_state=42,
+            max_depth=None,
+            min_samples_leaf=1,
+            n_jobs=-1,
+        )
 
-    vocabulary = build_vocabulary(disease_db)
+    clf.fit(X_np, y_idx)
+    return clf, training.label_map
 
-    keys = list(disease_db.keys())
-    X: List[List[int]] = []
-    y: List[str] = []
-
-    rng = random.Random(42)
-
-    for key in keys:
-        symptoms = list(disease_db[key].symptoms)
-        if not symptoms:
-            continue
-
-        # Always include the full symptom set to anchor the class.
-        X.append(vectorize_symptoms(symptoms, vocabulary))
-        y.append(key)
-
-        # Generate additional subsets.
-        subsets_generated = 0
-        # Shuffle to vary subset composition.
-        shuffled = symptoms[:]
-        rng.shuffle(shuffled)
-        while subsets_generated < max_subsets_per_disease:
-            # pick a subset size
-            k = rng.randint(min_subset_size, len(shuffled))
-            subset = rng.sample(shuffled, k)
-            if not subset:
-                continue
-            X.append(vectorize_symptoms(subset, vocabulary))
-            y.append(key)
-            subsets_generated += 1
-
-    return X, y, vocabulary
 
